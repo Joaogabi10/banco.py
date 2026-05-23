@@ -1,12 +1,16 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta, time
-import os
+from datetime import datetime, timedelta
+from streamlit_gsheets import GSheetsConnection
 
 # Configuração da página para ficar bonita no celular
 st.set_page_config(page_title="Banco de Horas", page_icon="⏰", layout="centered")
 
-ARQUIVO_EXCEL = "Banco_de_Horas_Web.xlsx"
+# URL da sua planilha do Google Sheets
+URL_PLANILHA = "https://docs.google.com/spreadsheets/d/15jqImj07pvjCdzhRuT74jYNiyIUp48E5Q7ZLXQcfr_4/edit?usp=sharing"
+
+# Inicializa a conexão com o Google Sheets
+conn = st.connection("gsheets", type=GSheetsConnection)
 
 def formatar_timedelta(td):
     total_seconds = int(td.total_seconds())
@@ -17,35 +21,46 @@ def formatar_timedelta(td):
     return f"{sinal}{hours:02d}:{minutes:02d}"
 
 def processar_e_salvar(df_novo):
-    """Calcula a evolução do saldo acumulado dia a dia e salva no Excel"""
-    df_novo = df_novo.sort_values(by="Data").reset_index(drop=True)
-    segundos_acumulados = df_novo["Base_Saldo_Segundos"].cumsum()
+    """Calcula a evolução do saldo acumulado dia a dia e envia para o Google Sheets"""
+    if not df_novo.empty:
+        # Garante a ordenação cronológica
+        df_novo = df_novo.sort_values(by="Data").reset_index(drop=True)
+        
+        # Recalcula os segundos acumulados
+        segundos_acumulados = df_novo["Base_Saldo_Segundos"].cumsum()
+        
+        lista_acumulado_txt = []
+        for seg in segundos_acumulados:
+            sinal = "-" if seg < 0 else "+"
+            h = abs(int(seg)) // 3600
+            m = (abs(int(seg)) % 3600) // 60
+            lista_acumulado_txt.append(f"{sinal}{h:02d}:{m:02d}")
+            
+        df_novo["Saldo Acumulado"] = lista_acumulado_txt
     
-    lista_acumulado_txt = []
-    for seg in segundos_acumulados:
-        sinal = "-" if seg < 0 else "+"
-        h = abs(int(seg)) // 3600
-        m = (abs(int(seg)) % 3600) // 60
-        lista_acumulado_txt.append(f"{sinal}{h:02d}:{m:02d}")
-        
-    df_novo["Saldo Acumulado"] = lista_acumulado_txt
-    saldo_final_mes = lista_acumulado_txt[-1] if lista_acumulado_txt else "00:00"
+    # Atualiza os dados na planilha oficial do Google Sheets
+    conn.update(spreadsheet=URL_PLANILHA, data=df_novo)
+    # Limpa o cache do Streamlit para forçar a leitura dos novos dados
+    st.cache_data.clear()
 
-    with pd.ExcelWriter(ARQUIVO_EXCEL, engine="openpyxl") as writer:
-        df_salvar = df_novo.drop(columns=["Base_Saldo_Segundos"], errors="ignore")
-        df_salvar.to_excel(writer, index=False, sheet_name="Resumo Mensal")
-        
-        df_resumo = pd.DataFrame([{"Saldo Acumulado do Mês": saldo_final_mes}])
-        df_resumo.to_excel(writer, index=False, sheet_name="Saldo Final")
-        
-    return saldo_final_mes
+@st.cache_data
+def ler_dados_google():
+    """Lê os dados em tempo real do Google Sheets"""
+    try:
+        df = conn.read(spreadsheet=URL_PLANILHA, ttl="0d")
+        # Trata o caso da planilha estar completamente vazia
+        if df.empty or df.columns[0].startswith("Unnamed"):
+            return pd.DataFrame(columns=["Data", "Entrada", "Saída Almoço", "Retorno Almoço", "Saída Trabalho", "Total Trabalhado", "Saldo do Dia", "Base_Saldo_Segundos", "Saldo Acumulado"])
+        return df
+    except:
+        return pd.DataFrame(columns=["Data", "Entrada", "Saída Almoço", "Retorno Almoço", "Saída Trabalho", "Total Trabalhado", "Saldo do Dia", "Base_Saldo_Segundos", "Saldo Acumulado"])
 
-# Gerador de horários formatados (ex: 08:00, 08:05, 08:10...) de 5 em 5 minutos para o Dropdown
+# Gerador de horários de 5 em 5 minutos
 @st.cache_data
 def gerar_lista_horarios():
     lista = []
     for hora in range(24):
-        for minuto in range(0, 60, 5): # Intervalo de 5 em 5 minutos para precisão sem rolar uma lista infinita
+        for minuto in range(0, 60, 5):
             lista.append(f"{hora:02d}:{minuto:02d}")
     return lista
 
@@ -56,6 +71,9 @@ st.title("⏰ Controle de Banco de Horas")
 
 # Abas do aplicativo
 aba_registrar, aba_gerenciar = st.tabs(["📝 Registrar Ponto", "🗑️ Apagar Registro Errado"])
+
+# Carrega os dados atuais vindos do Google Drive
+df_atual_google = ler_dados_google()
 
 # --- ABA 1: REGISTRAR PONTO ---
 with aba_registrar:
@@ -75,7 +93,6 @@ with aba_registrar:
     with st.form(key="form_ponto_horarios", clear_on_submit=False):
         if eh_sabado:
             st.info("📅 Data selecionada é um **Sábado**. Jornada padrão de **4 horas** (Sem almoço).")
-            # Seletores controlados via Dropdown (Já limitados e com formato garantido)
             ent = st.selectbox("Hora Entrada", options=OPCOES_HORARIOS, index=OPCOES_HORARIOS.index("08:00"))
             sai = st.selectbox("Hora Saída", options=OPCOES_HORARIOS, index=OPCOES_HORARIOS.index("12:00"))
             alm_s, alm_r = "", "" 
@@ -118,97 +135,74 @@ with aba_registrar:
                 "Saída Trabalho": sai,
                 "Total Trabalhado": formatar_timedelta(total_trabalhado),
                 "Saldo do Dia": formatar_timedelta(saldo_diario),
-                "Base_Saldo_Segundos": saldo_diario.total_seconds()
+                "Base_Saldo_Segundos": float(saldo_diario.total_seconds()),
+                "Saldo Acumulado": ""
             }
 
-            if os.path.exists(ARQUIVO_EXCEL):
-                try:
-                    df_existente = pd.read_excel(ARQUIVO_EXCEL, sheet_name="Resumo Mensal")
-                    if "Base_Saldo_Segundos" not in df_existente.columns:
-                        def texto_para_segundos(txt):
-                            try:
-                                s = -1 if str(txt).startswith("-") else 1
-                                txt = str(txt).replace("-", "")
-                                h, m = map(int, txt.split(":"))
-                                return s * ((h * 3600) + (m * 60))
-                            except:
-                                return 0
-                        df_existente["Base_Saldo_Segundos"] = df_existente["Saldo do Dia"].apply(texto_para_segundos)
-                        
-                    df_novo = pd.concat([df_existente, pd.DataFrame([novo_ponto])], ignore_index=True)
-                except:
-                    df_novo = pd.DataFrame([novo_ponto])
+            # Garante tipos de dados compatíveis antes do append
+            df_novo_registro = pd.DataFrame([novo_ponto])
+            if not df_atual_google.empty:
+                df_atual_google["Data"] = df_atual_google["Data"].astype(str)
+                df_atual_google["Base_Saldo_Segundos"] = df_atual_google["Base_Saldo_Segundos"].astype(float)
+                df_comb = pd.concat([df_atual_google, df_novo_registro], ignore_index=True)
             else:
-                df_novo = pd.DataFrame([novo_ponto])
+                df_comb = df_novo_registro
 
-            df_novo = df_novo.drop_duplicates(subset=["Data"], keep="last")
+            # Sobrescreve se a mesma data for digitada novamente
+            df_comb = df_comb.drop_duplicates(subset=["Data"], keep="last")
 
-            processar_e_salvar(df_novo)
-            st.success(f"Ponto salvo com sucesso!")
+            processar_e_salvar(df_comb)
+            st.success(f"Ponto guardado com sucesso no Google Sheets!")
             st.rerun()
 
         except Exception as e:
-            st.error(f"Erro inesperado ao calcular os horários: {e}")
+            st.error(f"Erro ao processar: {e}")
 
 # --- ABA 2: APAGAR REGISTRO ---
 with aba_gerenciar:
     st.subheader("Remover Pontos Incorretos")
-    if os.path.exists(ARQUIVO_EXCEL):
+    if not df_atual_google.empty:
         try:
-            df_atual = pd.read_excel(ARQUIVO_EXCEL, sheet_name="Resumo Mensal")
+            df_atual_google["ID_Linha"] = df_atual_google.index.astype(str)
+            df_atual_google["Identificador"] = "[" + df_atual_google["ID_Linha"] + "] Data: " + df_atual_google["Data"].astype(str) + " | Ent: " + df_atual_google["Entrada"] + " | Sai: " + df_atual_google["Saída Trabalho"]
             
-            if not df_atual.empty:
-                df_atual["ID_Linha"] = df_atual.index.astype(str)
-                df_atual["Identificador"] = "[" + df_atual["ID_Linha"] + "] Data: " + df_atual["Data"] + " | Ent: " + df_atual["Entrada"] + " | Sai: " + df_atual["Saída Trabalho"]
-                
-                registro_selecionado = st.selectbox(
-                    "Selecione exatamente qual registro deseja deletar:", 
-                    options=df_atual["Identificador"].tolist()
-                )
-                
-                id_para_deletar = int(registro_selecionado.split("]")[0].replace("[", ""))
-                
-                st.warning("⚠️ Atenção: Essa ação removerá permanentemente o registro selecionado!")
-                botao_deletar = st.button("🗑️ Apagar Registro Selecionado", type="primary")
-                
-                if botao_deletar:
-                    def texto_para_segundos(txt):
-                        try:
-                            s = -1 if str(txt).startswith("-") else 1
-                            txt = str(txt).replace("-", "")
-                            h, m = map(int, txt.split(":"))
-                            return s * ((h * 3600) + (m * 60))
-                        except:
-                            return 0
-                    df_atual["Base_Saldo_Segundos"] = df_atual["Saldo do Dia"].apply(texto_para_segundos)
-
-                    df_final = df_atual.drop(id_para_deletar)
-                    df_final = df_final.drop(columns=["Identificador", "ID_Linha"], errors="ignore")
-                    
-                    processar_e_salvar(df_final)
-                    st.success("Registro apagado com sucesso!")
-                    st.rerun()
-            else:
-                st.info("Não há registros salvos para apagar.")
+            registro_selecionado = st.selectbox(
+                "Selecione exatamente qual registro deseja deletar:", 
+                options=df_atual_google["Identificador"].tolist()
+            )
+            
+            id_para_deletar = int(registro_selecionado.split("]")[0].replace("[", ""))
+            
+            st.warning("⚠️ Atenção: Essa ação removerá permanentemente o registro selecionado!")
+            botao_deletar = st.button("🗑️ Apagar Registro Selecionado", type="primary")
+            
+            if botao_deletar:
+                df_final = df_atual_google.drop(id_para_deletar)
+                df_final = df_final.drop(columns=["Identificador", "ID_Linha"], errors="ignore")
+                processar_e_salvar(df_final)
+                st.success("Registro apagado com sucesso!")
+                st.rerun()
         except Exception as e:
             st.error(f"Erro ao processar exclusão: {e}")
     else:
-        st.info("Nenhum arquivo encontrado.")
+        st.info("Não há registros salvos para apagar.")
 
-# --- PAINEL INFORMATIVO DO SALDO ACUMULADO DO MÊS ---
+# --- PAINEL INFORMATIVO REAL TIME ---
 st.markdown("---")
-if os.path.exists(ARQUIVO_EXCEL):
+if not df_atual_google.empty:
     try:
-        df_ini = pd.read_excel(ARQUIVO_EXCEL, sheet_name="Saldo Final")
-        saldo_total_atual = df_ini.iloc[0]["Saldo Acumulado do Mês"]
+        saldo_total_atual = df_atual_google.iloc[-1]["Saldo Acumulado"]
         
         if "-" in str(saldo_total_atual):
             st.metric(label="📊 Saldo Final Acumulado do Mês", value=saldo_total_atual, delta="Devedor", delta_color="inverse")
         else:
             st.metric(label="📊 Saldo Final Acumulado do Mês", value=saldo_total_atual, delta="Crédito de Horas")
             
-        st.write("### Histórico e Evolução Diária:")
-        df_visualizacao = pd.read_excel(ARQUIVO_EXCEL, sheet_name="Resumo Mensal")
-        st.dataframe(df_visualizacao, use_container_width=True)
+        st.write("### Histórico e Evolução Diária (Google Sheets):")
+        # Esconde a coluna técnica de segundos para exibição
+        df_vis = df_atual_google.drop(columns=["Base_Saldo_Segundos", "ID_Linha", "Identificador"], errors="ignore")
+        st.dataframe(df_vis, use_container_width=True)
     except:
         pass
+else:
+    st.metric(label="📊 Saldo Final Acumulado do Mês", value="00:00", delta="Sem registros")
